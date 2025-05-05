@@ -16,6 +16,9 @@ from datetime import datetime
 from scipy.spatial import KDTree
 import numpy as np
 import networkx as nx
+import pythoncom
+from shapely.geometry import Polygon
+
 
 
 
@@ -27,7 +30,7 @@ class CADGeometryExtractor:
         self.target_layer = target_layer
         self.geometry_dict = {"LINE": {}, "ARC": {}} 
         self.handle_to_object = {}
-        self.tolerance = 1e-6  # 容差設定，保護浮點數運算精度
+        self.tolerance = 0  # 容差設定，保護浮點數運算精度
 
     def points_close(self, p1, p2):
         return math.dist(p1, p2) < self.tolerance
@@ -76,7 +79,11 @@ class CADGeometryExtractor:
     def _extract_line(self, line):
         handle = line.Handle
         start = tuple(line.StartPoint[:2])
-        end = tuple(line.EndPoint[:2])
+        end   = tuple(line.EndPoint[:2])
+
+        # ➤ 如果起點和終點重合，直接跳過
+        if self.points_close(start, end):
+            return
 
         # 檢查端點是否已存在
         if self._check_endpoints_exist(start, end):
@@ -96,34 +103,36 @@ class CADGeometryExtractor:
 
     def _extract_arc(self, arc):
         handle = arc.Handle
-        center = tuple(arc.Center[:2])
-        start = tuple(arc.StartPoint[:2])
-        end = tuple(arc.EndPoint[:2])
+        start  = tuple(arc.StartPoint[:2])
+        end    = tuple(arc.EndPoint[:2])
+
+        # ➤ 同樣，如果起點和終點重合，也跳過
+        if self.points_close(start, end):
+            return
 
         # 檢查端點是否已存在
         if self._check_endpoints_exist(start, end):
             return
 
-        # 計算凸度 (Bulge)
+        center = tuple(arc.Center[:2])
         start_angle = arc.StartAngle
-        end_angle = arc.EndAngle
+        end_angle   = arc.EndAngle
         included_angle = end_angle - start_angle
-        # 正規化包含角，確保為正值
         if included_angle < 0:
             included_angle += 2 * math.pi
-        # 計算凸度：tan(包含角/4)
         bulge = math.tan(included_angle / 4)
 
         self.geometry_dict["ARC"][handle] = {
             "Center": center,
             "Radius": arc.Radius,
-            "StartAngle": arc.StartAngle,
-            "EndAngle": arc.EndAngle,
+            "StartAngle": start_angle,
+            "EndAngle":   end_angle,
             "StartPoint": start,
-            "EndPoint": end,
-            "Bulge": bulge
+            "EndPoint":   end,
+            "Bulge":      bulge
         }
         self.handle_to_object[handle] = arc
+
 
     def _explode_polyline(self, pline):
         """分解 Polyline（無論是否閉合）"""
@@ -163,11 +172,12 @@ except Exception as e:
     print(f"Error: Unable to connect to AutoCAD: {e}")
     exit()
 
-# target_layers = "674_分區用地界線"   
-target_layers = "001-街廓"  
+target_layers = "674_分區用地界線"   
+# target_layers = "001-街廓"  
 # target_layers = "菓林人行道$0$01-街廓線"  
 # target_layers = "0-細部計畫線"  
-#20160808 細部計畫$0$0-分區街廓(都發局0707)
+# target_layers = "20160808 細部計畫$0$0-分區街廓(都發局0707)" 
+
 
 
 # 🔍 檢查圖層是否存在
@@ -182,83 +192,275 @@ print("🔎 提取圖層資料中...")
 extractor = CADGeometryExtractor(doc, target_layers)
 extractor.extract()
 geometry_dict = extractor.get_geometry()
-object_mapping = extractor.get_object_mapping()
 
 end_time = time.time()  # ⏱️ 結束計時
 print(f"幾何提取完成，用時：{end_time - start_time:.2f} 秒")
 
 
-    
-#%% 將polyline繪製到cad
+
+#%% 刪除被包含的線段
+
+def remove_contained_segments(geometry_dict, tol=0.01):
+    """
+    刪除 LINE 裡，完全被另一條 LINE 包含的短線段。
+    geometry_dict: {"LINE":{handle:{"StartPoint":(x,y),"EndPoint":(x,y),...}}, "ARC":{...}}
+    tol:         比對公差
+    回傳：新的 geometry_dict（LINE 已過濾）
+    """
+
+    def point_on_segment(p1, p2, q, tol):
+        # 判斷點 q 是否落在 p1→p2 線段上（包含端點）
+        dx, dy = p2[0]-p1[0], p2[1]-p1[1]
+        # 1) 共線性：cross ≈ 0
+        cross = dx*(q[1]-p1[1]) - dy*(q[0]-p1[0])
+        if abs(cross) > tol: 
+            return False
+        # 2) 投影落在 [0, |p2-p1|^2]
+        dot = (q[0]-p1[0])*dx + (q[1]-p1[1])*dy
+        if dot < -tol or dot > dx*dx + dy*dy + tol:
+            return False
+        return True
+
+    def segment_contains(p1, p2, q1, q2, tol):
+        # 判斷整條 q1→q2 線段是否完全落在 p1→p2 線段上
+        return point_on_segment(p1, p2, q1, tol) and point_on_segment(p1, p2, q2, tol)
+
+    lines = geometry_dict["LINE"]
+    handles = list(lines.keys())
+    to_remove = set()
+
+    # 兩兩比對：若 one 包含 two，就刪除較短的那條
+    for i in range(len(handles)):
+        h1 = handles[i]
+        p1, p2 = lines[h1]["StartPoint"], lines[h1]["EndPoint"]
+        L1 = lines[h1]["Length"]
+        for h2 in handles[i+1:]:
+            if h1 in to_remove or h2 in to_remove:
+                # 已標記移除的，就跳過
+                continue
+            q1, q2 = lines[h2]["StartPoint"], lines[h2]["EndPoint"]
+            L2 = lines[h2]["Length"]
+
+            if segment_contains(p1, p2, q1, q2, tol):
+                # h2 完全包含在 h1
+                if L1 >= L2:
+                    to_remove.add(h2)
+                else:
+                    to_remove.add(h1)
+            elif segment_contains(q1, q2, p1, p2, tol):
+                # h1 完全包含在 h2
+                if L2 >= L1:
+                    to_remove.add(h1)
+                else:
+                    to_remove.add(h2)
+
+    # 實際移除
+    for h in to_remove:
+        lines.pop(h, None)
+
+    return geometry_dict
+
+
+
+
+
+geometry_dict = remove_contained_segments(geometry_dict)
+
+#%% 刪除街廓內部不必要資訊
+
+def group_handles_by_endpoints(geometry_dict, tolerance=0.01):
+    # 定義容差比較函數
+    def points_close(p1, p2):
+        return math.dist(p1, p2) < tolerance
+
+    # 構建圖：每個Handle是一個節點，端點接近的Handle之間有邊
+    graph = defaultdict(list)
+    handles = list(geometry_dict["LINE"].keys()) + list(geometry_dict["ARC"].keys())
+
+    # 比較所有Handle對，檢查端點是否接近
+    for i, handle1 in enumerate(handles):
+        type1 = "LINE" if handle1 in geometry_dict["LINE"] else "ARC"
+        data1 = geometry_dict[type1][handle1]
+        start1, end1 = data1["StartPoint"], data1["EndPoint"]
+
+        for handle2 in handles[i+1:]:
+            type2 = "LINE" if handle2 in geometry_dict["LINE"] else "ARC"
+            data2 = geometry_dict[type2][handle2]
+            start2, end2 = data2["StartPoint"], data2["EndPoint"]
+
+            # 檢查任意端點是否接近
+            if (points_close(start1, start2) or points_close(start1, end2) or
+                points_close(end1, start2) or points_close(end1, end2)):
+                graph[handle1].append(handle2)
+                graph[handle2].append(handle1)
+
+    # 使用DFS尋找連通組件
+    def dfs(handle, visited, component):
+        visited.add(handle)
+        component.append(handle)
+        for neighbor in graph[handle]:
+            if neighbor not in visited:
+                dfs(neighbor, visited, component)
+
+    # 遍歷所有Handle，找到所有連通組件
+    visited = set()
+    groups = []
+    for handle in handles:
+        if handle not in visited:
+            component = []
+            dfs(handle, visited, component)
+            if component:  # 確保組不為空
+
+                groups.append(component)
+    groups = [grp for grp in groups if len(grp) >= 3]
+
+    return groups
+
+
+
+
+def calculate_angle(p1, p2, p3, in_degrees=True):
+    """
+    計算三點 p1, p2, p3 在 p2 點處所形成的角度。
+
+    參數：
+        p1, p2, p3: tuple of float，格式為 (x, y)
+        in_degrees: bool，是否以度數回傳，預設 True（否則回傳弧度）
+
+    回傳：
+        float，夾角值（0～π 弧度 或 0～180 度）
+
+    範例：
+        >>> calculate_angle((1,0), (0,0), (0,1))
+        90.0
+    """
+    # 向量 v1 = p1→p2, v2 = p3→p2
+    v1 = (p1[0] - p2[0], p1[1] - p2[1])
+    v2 = (p3[0] - p2[0], p3[1] - p2[1])
+
+    # 長度檢查
+    norm1 = math.hypot(v1[0], v1[1])
+    norm2 = math.hypot(v2[0], v2[1])
+    if norm1 == 0 or norm2 == 0:
+        # raise ValueError("其中一條向量長度為零，無法計算夾角")
+        print("其中一條向量長度為零，無法計算夾角")
+        return 0
+
+    # 計算點積與向量外積（在平面上當作標量）
+    dot   = v1[0]*v2[0] + v1[1]*v2[1]
+    cross = v1[0]*v2[1] - v1[1]*v2[0]
+
+    # 以 atan2(|cross|, dot) 得到 0～π 之間的夾角
+    angle = math.atan2(abs(cross), dot)
+
+    return math.degrees(angle) if in_degrees else angle
+
+
+
+
+def walk_maze_from_groups(groups, geometry_dict, tolerance=0.1):
+    # 定義容差比較函數
+    def points_close(p1, p2):
+        return math.dist(p1, p2) < tolerance
+# sub_group = groups[0]
+    # 從每個sub_group生成路徑
+    paths = []
+    for sub_group in groups:
+        if not sub_group:
+            continue
+
+        # 獲取所有座標並找到最左下角的起點
+        handle_to_points = {}
+        start_points = []
+        for handle in sub_group:
+            type_ = "LINE" if handle in geometry_dict["LINE"] else "ARC"
+            data = geometry_dict[type_][handle]
+            start, end = data["StartPoint"], data["EndPoint"]
+            handle_to_points[handle] = (start, end)
+            start_points.append((start, handle))
+            start_points.append((end, handle))  # 考慮終點也可能是起點
+
+        # 找到最左下角的起點
+        start_point, start_handle = min(start_points,
+                                        key=lambda item: (item[0][0], item[0][1]))  # 先比 x，再比 y
+        # 確定起點方向（根據start_handle的起點還是終點）
+        start_start, start_end = handle_to_points[start_handle]
+        current_point = start_point
+        next_point = start_end if points_close(start_point, start_start) else start_start
+        is_reverse = points_close(start_point, start_end)
+        current_handle = start_handle + "_r" if is_reverse else start_handle
+        # 儲存路徑和已刪除的Handle，起點不添加_r
+        path = [current_handle]
+        remaining_handles = set(sub_group) - {start_handle}  # 剩餘可用的Handle
+        visited_points = {start_point, next_point}
+        
+        returned_to_start = False
+
+        while remaining_handles:
+            # 尋找與當前點（next_point）相連的下一個Handle
+            candidates = []
+            for handle in remaining_handles:
+                start, end = handle_to_points[handle]
+                if points_close(next_point, start):
+                    candidates.append((handle, end, False))  # 正向
+                elif points_close(next_point, end):
+                    candidates.append((handle, start, True))  # 反向
+
+            if not candidates:
+                break  # 無路可走，結束
+
+            if len(candidates) == 1:
+                # 只有一條路，直接走
+                handle, next_candidate_point, is_reverse = candidates[0]
+                # 根據是否反向決定是否添加_r後綴
+                handle_to_add = handle + "_r" if is_reverse else handle
+                path.append(handle_to_add)
+                remaining_handles.remove(handle)
+                current_point = next_point
+                next_point = next_candidate_point
+                visited_points.add(next_point)
+            else:
+                # 有多條路，選擇夾角最大的
+                angles = []
+                for handle, next_candidate_point, is_reverse in candidates:
+                    # 計算夾角（prev_point -> current_point -> next_candidate_point）
+                    angle = calculate_angle(current_point, next_point, next_candidate_point)
+                    angles.append((angle, handle, next_candidate_point, is_reverse))
+
+                # 按角度從大到小排序
+                angles.sort(reverse=True)
+                chosen_angle, chosen_handle, chosen_next_point, chosen_is_reverse = angles[0]
+                
+                # 將未選擇的路徑從remaining_handles中移除
+                for _, handle, _, _ in angles[1:]:
+                    remaining_handles.remove(handle)
+                
+                # 走選擇的路徑
+                # 根據是否反向決定是否添加_r後綴
+                handle_to_add = chosen_handle + "_r" if chosen_is_reverse else chosen_handle
+                path.append(handle_to_add)
+                remaining_handles.remove(chosen_handle)
+                current_point = next_point
+                next_point = chosen_next_point
+                visited_points.add(next_point)
+
+            # 如果回到起點，結束
+            if points_close(next_point, start_point) and len(path) > 1:
+                returned_to_start = True
+                break
+        if returned_to_start:
+            paths.append(path)
+
+    return paths
+
+
+
+
 # 計算距離
 def calculate_distance(point_1, point_2):
     x1, y1 = point_1
     x2, y2 = point_2
     return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
-
-
-# 構建圖（獲取每一個handle可以連接的其他handle）
-def build_graph_kdtree_numpy(coor_df, threshold):
-    graph = defaultdict(list)
-    handles = np.array(coor_df.index)
-
-    # 將所有起點與終點轉為 numpy array
-    coordinates = np.array([coor_df.loc[h, 'Coordinate'] for h in handles], dtype=object)
-    start_points = np.array([coord[0] for coord in coordinates])
-    end_points = np.array([coord[1] for coord in coordinates])
-
-    # 建立 handle -> 去掉 _r 對應表，加速比較
-    original_handles = np.array([h.replace('_r', '') for h in handles])
-
-    # 用起點建 KDTree，讓終點去查
-    tree = KDTree(start_points)
-
-    for i, handle1 in enumerate(handles):
-        end_point = end_points[i]
-        idx_list = tree.query_ball_point(end_point, threshold)
-
-        for j in idx_list:
-            handle2 = handles[j]
-
-            if handle1 == handle2:
-                continue
-
-            if original_handles[i] == original_handles[j]:  # 是反向版本就略過
-                continue
-
-            graph[handle1].append(handle2)
-
-    return graph
-
-
-# 獲取路徑的頂點座標
-def get_path_points(path, coor_df):
-    points = []
-    for i, handle in enumerate(path):
-        coords = coor_df.loc[handle, 'Coordinate']
-        start, end = coords
-
-        if i == 0:
-            points.append(start)
-        points.append(end)
-
-    if calculate_distance(points[0], points[-1]) < threshold:
-        return points
-    return points + [points[0]]
-
-def deduplicate_cycles(cycles):
-    seen = set()
-    deduped = []
-
-    for cycle in cycles:
-        normalized = frozenset(h.replace('_r', '') for h in cycle)
-
-        if normalized not in seen:
-            seen.add(normalized)
-            deduped.append(cycle)
-
-    return deduped
-
 
 
 
@@ -283,109 +485,80 @@ def get_coord_df(geometry_dict):
             }, index=[handle])
             coor_df = pd.concat([coor_df, row])
 
-            # ✅ 只有 problem_handles 才建立反向版本
-            if handle in problem_handles:
-                reversed_handle = f"{handle}_r"
-                reversed_bulge = -bulge if geom_type == 'ARC' else bulge
-                row_reversed = pd.DataFrame({
-                    'Coordinate': [(end_point, start_point)],
-                    'Bulge': [reversed_bulge]
-                }, index=[reversed_handle])
-                coor_df = pd.concat([coor_df, row_reversed])
+            # 為所有Handle生成反向版本
+            reversed_handle = f"{handle}_r"
+            reversed_bulge = -bulge if geom_type == 'ARC' else bulge
+            row_reversed = pd.DataFrame({
+                'Coordinate': [(end_point, start_point)],
+                'Bulge': [reversed_bulge]
+            }, index=[reversed_handle])
+            coor_df = pd.concat([coor_df, row_reversed])
                 
     return coor_df
 
 
-def classify_connection_types_from_geometry_dict(geometry_dict, threshold):
-    # 合併 LINE 和 ARC handle 的起點與終點
-    all_segments = {}
-    for geom_type in ['LINE', 'ARC']:
-        for handle, data in geometry_dict[geom_type].items():
-            start = data['StartPoint']
-            end = data['EndPoint']
-            all_segments[handle] = (start, end)
 
-    handles = list(all_segments.keys())
-    results = {
-        'end_to_start': [],
-        'end_to_end': [],
-        'start_to_start': [],
-        'start_to_end': []
-    }
 
-    for h1 in handles:
-        s1, e1 = all_segments[h1]
+# 構建圖（獲取每一個handle可以連接的其他handle）
+def build_graph_kdtree_numpy(coor_df, threshold):
+    graph = defaultdict(list)
+    handles = np.array(coor_df.index)
 
-        for h2 in handles:
-            if h1 == h2:
+    # 將所有起點與終點轉為 numpy array
+    coordinates = np.array([coor_df.loc[h, 'Coordinate'] for h in handles], dtype=object)
+    start_points = np.array([coord[0] for coord in coordinates])
+    end_points = np.array([coord[1] for coord in coordinates])
+
+    # 建立 handle -> 去掉 _r 對應表，加速比較
+    original_handles = np.array([h.replace('_r', '') for h in handles])
+
+    # 用起點建 KDTree，讓終點去查
+    tree = KDTree(start_points)
+
+    for i, handle1 in enumerate(handles):
+        end_point = end_points[i]
+        idx_list = tree.query_ball_point(end_point, threshold)
+        
+        for j in idx_list:
+            handle2 = handles[j]
+            if handle1 == handle2:
                 continue
 
-            s2, e2 = all_segments[h2]
-
-            if calculate_distance(e1, s2) < threshold:
-                results['end_to_start'].append((h1, h2))
-            elif calculate_distance(e1, e2) < threshold:
-                results['end_to_end'].append((h1, h2))
-            elif calculate_distance(s1, s2) < threshold:
-                results['start_to_start'].append((h1, h2))
-            elif calculate_distance(s1, e2) < threshold:
-                results['start_to_end'].append((h1, h2))
-                
-                
-    problem_handles = list(set(h for h, _ in results['end_to_end'] + results['start_to_start']))
-    return problem_handles
-
-
-
-def filter_outer_cycles_by_geometry(cycles, handle_coords, buffer_tolerance=0.01):
-    from shapely.geometry import Polygon
-
-    poly_with_area = []
-    for cycle in cycles:
-        points = []
-        for i, h in enumerate(cycle):
-            start, end = handle_coords[h]
-            if i == 0:
-                points.append(start)
-            points.append(end)
-        polygon = Polygon(points)
-        if polygon.is_valid and polygon.area > 0:
-            poly_with_area.append((cycle, polygon))
-
-    keep = []
-    for i, (cycle_i, poly_i) in enumerate(poly_with_area):
-        is_inner = False
-        for j, (cycle_j, poly_j) in enumerate(poly_with_area):
-            if i == j:
+            if original_handles[i] == original_handles[j]:  # 是反向版本就略過
                 continue
-            # 使用 buffer 容差判定是否被包在別人裡面
-            if poly_i.within(poly_j.buffer(buffer_tolerance)):
-                is_inner = True
-                break
-        if not is_inner:
-            keep.append(cycle_i)
 
-    return keep
+            graph[handle1].append(handle2)
+
+    return graph
 
 
 
-def get_polyline_path_list(coor_df, threshold):
-    s = time.time()
-    
-    graph = build_graph_kdtree_numpy(coor_df, threshold)
-    
-    G = nx.DiGraph(graph)
-    cycles = list(nx.simple_cycles(G))
-    # cycles = deduplicate_cycles(cycles)
-    
-    handle_coords = {h: coor_df.at[h, 'Coordinate'] for h in coor_df.index}
-    
-    # 🎯 篩選掉內部的封閉區域
-    outer_cycles = filter_outer_cycles_by_geometry(cycles, handle_coords, buffer_tolerance=0.01)    
 
-    e = time.time()
-    print(f"完成，用時：{e - s:.2f} 秒")
-    return outer_cycles
+# 獲取路徑的頂點座標
+def get_path_points(path, coor_df):
+    points = []
+    for i, handle in enumerate(path):
+        coords = coor_df.loc[handle, 'Coordinate']
+        start, end = coords
+
+        if i == 0:
+            points.append(start)
+        points.append(end)
+
+    if calculate_distance(points[0], points[-1]) < threshold:
+        return points
+    return points + [points[0]]
+
+
+
+
+def get_polyline_path_list(geometry_dict, threshold):
+    groups = group_handles_by_endpoints(geometry_dict)
+    cycles = walk_maze_from_groups(groups, geometry_dict)  
+
+    return cycles
+
+
 
 
 def draw_polyline(layer_name,polyline_path_list,  coor_df):
@@ -398,14 +571,10 @@ def draw_polyline(layer_name,polyline_path_list,  coor_df):
     for polyline_handles in polyline_path_list:
         vertices = []
         bulges = []
-        
-        points = get_path_points(polyline_handles, coor_df)
-    
+            
         for i, handle in enumerate(polyline_handles):
             # 移除 _r 後綴以映射回原始 handle
             original_handle = handle.replace('_r', '')
-            geom_type = 'LINE' if original_handle in geometry_dict['LINE'] else 'ARC'
-            obj_data = geometry_dict[geom_type][original_handle]
             # 使用 coor_df 中的座標，而不是 geometry_dict，因為方向可能已反轉
             start_point, end_point = coor_df.loc[handle, 'Coordinate']
             bulge = coor_df.loc[handle, 'Bulge']
@@ -433,23 +602,21 @@ def draw_polyline(layer_name,polyline_path_list,  coor_df):
         
 
 print("🔎 建立polyline中...")
-threshold = 0.1
-
-#座標會反向連接，因此將end_to_end跟start_to_start的座標在coord_df中新增一個反向
-problem_handles = classify_connection_types_from_geometry_dict(geometry_dict, threshold)
+threshold = 1e-6
 
 #取得handle座標df
 coor_df = get_coord_df(geometry_dict)
 
 #取得最終polyline的list
-polyline_path_list = get_polyline_path_list(coor_df, threshold)
+polyline_path_list = get_polyline_path_list(geometry_dict, threshold)
 
 # 繪製到 AutoCAD
 now_str = datetime.now().strftime('%Y%m%d%H%M%S')
-layer_name = f"test{now_str}"
+layer_name = f"polyline_{now_str}"
 draw_polyline(layer_name,polyline_path_list,  coor_df)
 
-    
+
+ 
 #%% get polyline
 
 
@@ -505,7 +672,7 @@ def extract_polylines_from_layer(doc, layer_name):
 
 
 # layer_name = 'test20250429215447'
-layer_name = 'test20250502155511'
+# layer_name = 'test20250502155511'
 print("🔎 讀取polyline中...")
 polylines = extract_polylines_from_layer(doc, layer_name)
 
@@ -513,9 +680,6 @@ polylines = extract_polylines_from_layer(doc, layer_name)
 
 #%% 畫角平分線
 
-import math
-import pythoncom
-from win32com.client import VARIANT
 from math import hypot
 import heapq
 
@@ -610,7 +774,6 @@ def calculate_angle_bisector(p1, p2, p3, bulge1, bulge2, points):
     # 確保指向內部
     test = (p2[0]+bis[0]*L*0.5, p2[1]+bis[1]*L*0.5)
     try:
-        from shapely.geometry import Polygon, Point
         poly = Polygon(points)
         if poly.is_valid and not poly.contains(Point(test)):
             bis = (-bis[0], -bis[1])
@@ -1146,7 +1309,6 @@ def draw_corner_lines(doc, path, corner_runs, intersections, layer_name):
         return (v[0]/mag, v[1]/mag) if mag>1e-12 else (0,0)
 
     pts    = path['points']
-    bulges = path['bulges']
     closed = path['closed']
     m = len(pts) - (1 if closed and pts[0]==pts[-1] else 0)
 
@@ -1336,6 +1498,9 @@ boundary_points = [
     if "boundary_point" in info and info["boundary_point"] is not None
 ]
 
+
+
+
 #%% 繪製道路中心線
 from math import atan, sin, cos, pi
 from shapely.ops import unary_union
@@ -1389,6 +1554,12 @@ def bulge_to_arc(p1, p2, bulge, segments):
         pts.append((cx + radius*cos(t), cy + radius*sin(t)))
     return pts
 
+
+# pl = polylines[1]
+# points = pl['points']
+# bulges = pl['bulges']
+# closed = pl['closed']
+
 def polyline_to_polygon(points, bulges, closed, arc_segments):
     """
     points: list of (x,y)
@@ -1414,6 +1585,7 @@ def polyline_to_polygon(points, bulges, closed, arc_segments):
     return Polygon(lr)
 
 
+
 polys = []
 for pl in polylines:
     poly = polyline_to_polygon(pl['points'], pl['bulges'], pl['closed'], arc_segments=1024)
@@ -1423,32 +1595,9 @@ for pl in polylines:
 valid_polys = []
 invalid_handles = []
 for i, poly in enumerate(polys): # 假設 polys 是 Polygon 物件列表
-    # 或者如果你有 handle 資訊: for handle, poly in red_polygons.items():
-    if poly is None:
-         print(f"警告: 在索引 {i} 處發現 None 值。") # 或 handle
-         continue
+    valid_polys.append(poly)
 
-    if poly.is_valid:
-        valid_polys.append(poly)
-    else:
-        print(f"警告: 在索引 {i} 處的多邊形無效。嘗試修復...") # 或 handle
-        # 嘗試使用 buffer(0) 修復
-        fixed_poly = poly.buffer(0)
-        if fixed_poly.is_valid and isinstance(fixed_poly, Polygon):
-             print(f"   成功修復索引 {i} 的多邊形。")
-             valid_polys.append(fixed_poly)
-        else:
-             print(f"   ❌ 無法修復索引 {i} 的多邊形。類型: {fixed_poly.geom_type}")
-             # 記錄無效多邊形的 handle (如果有的話)
-             # invalid_handles.append(handle)
-
-# 然後只對有效的多邊形進行 union
-if valid_polys:
-    street_region = unary_union(valid_polys)
-    print(f"成功對 {len(valid_polys)} 個有效多邊形執行 unary_union。")
-else:
-    print("❌ 沒有有效的多邊形可供合併。")
-    street_region = None # 或者一個空的 GeometryCollection
+street_region = unary_union(valid_polys)
 
 outer = street_region.convex_hull
 
@@ -1846,7 +1995,76 @@ def vertex_angle(p_prev, p_cur, p_next):
     return theta_deg
 
 
+def draw_catch_basin(
+    ms,
+    cx,
+    cy,
+    angle,
+    half,
+    insetsize,
+    layer_name,
+    color=6
+):
+    """
+    繪製集水井符號：
+      - 外層正方形 (邊長 = 2*half)
+      - 內層同心正方形 (邊長 = 2*(half - insetsize))
+      - 內層正方形內畫 X
 
+    參數：
+      ms          : ModelSpace
+      cx, cy      : 正方形中心
+      angle       : 旋轉角度 (弧度)
+      half        : 外層半邊長
+      insetsize   : 內層縮入距離
+      layer_name  : 圖層名稱
+      color       : 顏色編號
+    """
+    ct = math.cos(angle)
+    st = math.sin(angle)
+
+    # 外層正方形
+    outer = []
+    for lx, ly in [(-half,-half),( half,-half),( half, half),(-half, half)]:
+        xw = cx + lx*ct - ly*st
+        yw = cy + lx*st + ly*ct
+        outer.extend([xw, yw])
+    va_outer = VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_R8, outer)
+    sq = ms.AddLightWeightPolyline(va_outer)
+    sq.Closed = True
+    sq.Layer  = layer_name
+    sq.Color  = color
+    sq.Update()
+
+    # 內層同心正方形
+    inner_half = half - insetsize
+    if inner_half > 0:
+        inner = []
+        for lx, ly in [(-inner_half,-inner_half),( inner_half,-inner_half),
+                       ( inner_half, inner_half),(-inner_half, inner_half)]:
+            xw = cx + lx*ct - ly*st
+            yw = cy + lx*st + ly*ct
+            inner.extend([xw, yw])
+        va_inner = VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_R8, inner)
+        sq2 = ms.AddLightWeightPolyline(va_inner)
+        sq2.Closed = True
+        sq2.Layer   = layer_name
+        sq2.Color   = color
+        sq2.Update()
+
+        # X 標記
+        p0 = (inner[0], inner[1])
+        p1 = (inner[2], inner[3])
+        p2 = (inner[4], inner[5])
+        p3 = (inner[6], inner[7])
+        for a, b in ((p0,p2),(p1,p3)):
+            ln = ms.AddLine(
+                VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_R8,(a[0],a[1],0.0)),
+                VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_R8,(b[0],b[1],0.0))
+            )
+            ln.Layer = layer_name
+            ln.Color = color
+            ln.Update()
 
 
 def batch_offset_polylines(
@@ -1860,188 +2078,94 @@ def batch_offset_polylines(
     dst_layer='test_off'
 ):
     """
-    批次對多段線做 Offset，並在偏移距離 = offset_dist 的中心線上，
-    每個頂點繪製旋轉方塊。若該頂點對應的 bulge ≠ 0，則用「前一段向量」
-    而非「下一段向量」來計算旋轉角度。
-
-    參數說明同上，此處省略。
+    批次對多段線做 Offset，並在符合轉折角範圍的頂點上，
+    呼叫 draw_catch_basin 繪製集水井。
     """
     ms = doc.ModelSpace
 
-    #── 確保目標圖層存在且解鎖 ──#
+    # 圖層設定
     try:
         lyr = doc.Layers.Item(dst_layer)
         lyr.Lock = False
     except:
         lyr = doc.Layers.Add(dst_layer)
 
-    #── 確保虛線線型存在 ──#
-    dashed = "DASHED"
+    dashed = 'DASHED'
     try:
         doc.Linetypes.Item(dashed)
     except:
-        try:    doc.Linetypes.Load(dashed, "acad.lin")
-        except: dashed = "CONTINUOUS"
+        try: doc.Linetypes.Load(dashed, 'acad.lin')
+        except: dashed = 'CONTINUOUS'
 
     success_count = 0
     square_count  = 0
 
-    #── 逐條多段線處理 ──#
     for info in polylines_info:
+        ent = doc.HandleToObject(info['handle'])
         h = info['handle']
-        try:
-            ent = doc.HandleToObject(h)
-        except:
-            print(f"⚠️ 找不到 handle={h}，跳過")
-            continue
-        if ent.ObjectName not in ('AcDbPolyline','AcDbLine'):
-            continue
-
-        #── 計算欲偏移的距離串 ──#
-        if width > 0:
-            offsets = [offset_dist+width/2,
-                       offset_dist-width/2,
-                       offset_dist]
-        else:
-            offsets = [offset_dist]
-
-        main_offset_entities = []
-
-        #── 執行 OFFSET──#
+        print(h)
+        # 計算偏移距離清單
+        offsets = ([offset_dist+width/2, offset_dist-width/2, offset_dist]
+                   if width>0 else [offset_dist])
+        centers = []
         for dist in offsets:
-            try:
-                res = ent.Offset(dist)
-            except:
-                continue
+            res = ent.Offset(dist)
             ents = list(res) if isinstance(res,(tuple,list)) else [res]
             for ne in ents:
                 ne.Layer = dst_layer
-                if abs(dist-offset_dist) < 1e-6:
-                    ne.Linetype      = dashed
+                if abs(dist-offset_dist)<1e-6:
+                    ne.Linetype = dashed
                     ne.LinetypeScale = 1.0
-                    main_offset_entities.append(ne)
+                    centers.append(ne)
                 ne.Update()
                 success_count += 1
 
-        #── 畫集水井 ──#
-        if square_width > 0:
-            half = square_width / 2
-
-            for ne in main_offset_entities:
-                if not hasattr(ne, "Coordinates"):
+        # 在偏移後中心線各頂點決定是否繪製集水井
+        if square_width>0:
+            half = square_width/2
+            for ne in centers:
+                if not hasattr(ne,'Coordinates'):
+                    print('111')
                     continue
-                # 讀出所有頂點
                 arr  = list(ne.Coordinates)
-                pts2 = [(arr[i*2], arr[i*2+1]) for i in range(len(arr)//2)]
-
-                # 一一對每個頂點畫方塊
-                for j, (cx, cy) in enumerate(pts2):
-                    # 取 bulge（針對 polyline）
-                    bulge = 0
-                    if ent.ObjectName == 'AcDbPolyline':
-                        try:
-                            bulge = ne.GetBulge(j)
-                        except:
-                            bulge = 0
-                                                       
-                    p_prev = pts2[j-1] 
-                    p_cur  = pts2[j]
+                pts2 = [(arr[i*2],arr[i*2+1]) for i in range(len(arr)//2)]
+                for j,(cx,cy) in enumerate(pts2):
+                    # 計算前後夾角
+                    p_prev = pts2[j-1] if j>0 else pts2[-1]
                     p_next = pts2[j+1] if j<len(pts2)-1 else pts2[0]
-                    angle = vertex_angle(p_prev, p_cur, p_next)
-                    
-                    #設置轉折點在90~160度才畫集水井
-                    if draw_junction_angle[0] <= angle <= draw_junction_angle[1]:
-                        # 計算「前一段」與「下一段」向量
-                        if bulge == 0:
-                            nx, ny = pts2[j+1] if j<len(pts2)-1 else pts2[0]
-                            dx, dy = nx - cx, ny - cy
-                        elif bulge!= 0:
-                            px, py = pts2[j-1]
-                            dx, dy = cx - px, cy - py                      
-    
-                        # 將向量標準化
-                        L = math.hypot(dx, dy)
-                        if L < 1e-6:
-                            dx, dy = 1, 0
-                        else:
-                            dx /= L; dy /= L
-    
-                        # 計算與水平線的弧度夾角
-                        angle = math.atan2(dy, dx)
-                        # （bulge 情況已由上面邏輯決定反向向量）
-    
-                        # # 根據此角度把本地正方形頂點旋轉到世界座標
-                        # va = []
-                        # ct, st = math.cos(angle), math.sin(angle)
-                        # for lx, ly in [(-half,-half),( half,-half),
-                        #                ( half, half),(-half, half)]:
-                        #     xw = cx + lx*ct - ly*st
-                        #     yw = cy + lx*st + ly*ct
-                        #     va.extend([xw, yw])
-    
-                        # # 畫出封閉多段線（正方形）
-                        # arr_va = VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_R8, va)
-                        # sq = ms.AddLightWeightPolyline(arr_va)
-                        # sq.Closed = True
-                        # sq.Layer  = dst_layer
-                        # sq.Update()
-                        # square_count += 1
-                        # 計算好旋轉角度 θ 之後，先畫「外層」正方形
-                        va = []
-                        ct, st = math.cos(angle), math.sin(angle)
-                        for lx, ly in [(-half,-half),( half,-half),
-                                       ( half, half),(-half, half)]:
-                            xw = cx + lx*ct - ly*st
-                            yw = cy + lx*st + ly*ct
-                            va.extend([xw, yw])
-        
-                        arr_va = VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_R8, va)
-                        sq = ms.AddLightWeightPolyline(arr_va)
-                        sq.Closed = True
-                        sq.Layer  = dst_layer
-                        sq.Update()
-                        square_count += 1
-        
-                        #── 接著畫「內層」同心正方形──#
-                        inner_half = half - insetsize
-                        if inner_half > 0:
-                            va2 = []
-                            for lx, ly in [(-inner_half,-inner_half),
-                                           ( inner_half,-inner_half),
-                                           ( inner_half, inner_half),
-                                           (-inner_half, inner_half)]:
-                                xw = cx + lx*ct - ly*st
-                                yw = cy + lx*st + ly*ct
-                                va2.extend([xw, yw])
-        
-                            arr_va2 = VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_R8, va2)
-                            sq2 = ms.AddLightWeightPolyline(arr_va2)
-                            sq2.Closed = True
-                            sq2.Layer  = dst_layer
-                            sq2.Color  = sq.Color  # 跟外層一樣顏色
-                            sq2.Update()
-        
-                            #── 在內層正方形畫 X──#
-                            # 頂點順序：0:(-,-), 1:(+,-), 2:(+,+), 3:(-,+)
-                            # X 由 0→2 與 1→3 兩條線組成
-                            p0 = (va2[0], va2[1])
-                            p1 = (va2[2], va2[3])
-                            p2 = (va2[4], va2[5])
-                            p3 = (va2[6], va2[7])
-        
-                            ln1 = ms.AddLine(VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_R8, (*p0,0.0)),
-                                             VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_R8, (*p2,0.0)))
-                            ln2 = ms.AddLine(VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_R8, (*p1,0.0)),
-                                             VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_R8, (*p3,0.0)))
-                            for ln in (ln1, ln2):
-                                ln.Layer = dst_layer
-                                ln.Color = sq.Color
-                                ln.Update()
-        
-                            square_count += 1  # 也可不算入次數
+                    ang = vertex_angle(p_prev,(cx,cy),p_next)
+                    if ang is None: continue
+                    # 角度範圍檢查
+                    if not (draw_junction_angle[0] <= ang <= draw_junction_angle[1]):
+                        continue
+                    # 取 bulge 並決定向量
+                    bulge = 0
+                    if ent.ObjectName=='AcDbPolyline':
+                        try: bulge = ne.GetBulge(j)
+                        except: bulge=0
+                    if bulge!=0 and j>0:
+                        dx = cx - pts2[j-1][0]
+                        dy = cy - pts2[j-1][1]
+                    else:
+                        nx_,ny_ = pts2[(j+1)%len(pts2)]
+                        dx = nx_-cx; dy = ny_-cy
 
-    #── 完成後刷新視窗 ──#
+                    # 標準化
+                    L = math.hypot(dx,dy)
+                    if L<1e-6: dx,dy=1,0
+                    else: dx/=L; dy/=L
+                    angle = math.atan2(dy,dx)
+
+                    # 繪製集水井
+                    draw_catch_basin(
+                        ms, cx, cy,
+                        angle, half,
+                        insetsize, dst_layer
+                    )
+                    square_count += 1
+
     doc.Regen(0)
+    print(f"✅ 偏移完成: {success_count} 條, 集水井: {square_count} 個。")
 
 
 # 示例调用
