@@ -15,7 +15,6 @@ from collections import defaultdict
 from datetime import datetime
 from scipy.spatial import KDTree
 import numpy as np
-import networkx as nx
 import pythoncom
 from shapely.geometry import Polygon
 
@@ -159,7 +158,68 @@ class CADGeometryExtractor:
         return self.handle_to_object.get(handle, None)
 
 
-#%% main
+#%% 將目標圖層執行 -> overkill
+import pywintypes # 用於捕捉特定的 COM 錯誤
+
+def run_overkill_on_layer(doc, layer_name):
+    """
+    在指定的 AutoCAD 圖層上執行 OVERKILL 指令（指令行版本）。
+
+    Args:
+        doc: AutoCAD Document 物件 (來自 win32com.client)。
+        layer_name (str): 要執行 OVERKILL 的目標圖層名稱。
+
+    Returns:
+        bool: 如果指令成功發送則返回 True，否則返回 False。
+    """
+    if not doc:
+        print("❌ 錯誤：未提供有效的 AutoCAD Document 物件。")
+        return False
+
+    print(f"⚙️ 準備在圖層 '{layer_name}' 上執行 -OVERKILL...")
+
+    # 构建指令字串：
+    # 1. -OVERKILL : 啟動指令行版本的 OVERKILL
+    # 2. (ssget "_X" '((8 . "layer_name"))) : 使用 LISP 選擇指定圖層上的所有物件
+    #    - _X : 在整個圖面資料庫中搜索
+    #    - '((8 . "layer_name")) : DXF 群組碼 8 (圖層名稱) 的過濾條件
+    #    - 注意 LISP 表達式中字串的引號需要正確處理
+    # 3. \r : 代表按下 Enter，完成物件選擇
+    # 4. \r : 代表再次按下 Enter，接受 OVERKILL 的預設設定並執行
+
+    # 使用 f-string 格式化圖層名稱，並處理 LISP 中的引號
+    # LISP 內部使用單引號和雙引號，所以 Python 字串使用不同的引號包起來
+    lisp_selector = f'(ssget "_X" \'((8 . "{layer_name}")))\')'
+
+    # 使用 \r 代表 Enter
+    command_string = f"-OVERKILL\r{lisp_selector}\r\r"
+
+    try:
+        # 發送指令到 AutoCAD
+        # SendCommand 是異步的，它會立即返回，而 AutoCAD 會在背景執行
+        doc.SendCommand(command_string)
+
+        # 短暫等待讓 AutoCAD 有時間處理指令
+        # 這個時間可能需要根據你的系統和圖檔複雜度調整
+        # 注意：這並不能保證 OVERKILL 100% 完成，只是給它時間開始執行
+        time.sleep(2) # 等待 2 秒
+
+        print(f"✅ -OVERKILL 指令已成功發送到圖層 '{layer_name}'。")
+        # 你可以檢查 doc.ActiveSelectionSet.Count 看是否還有選取的物件 (OVERKILL 後應該沒有)
+        # 但 SendCommand 的異步特性讓這不一定可靠
+        return True
+
+    except pywintypes.com_error as com_err:
+        print(f"❌ 在圖層 '{layer_name}' 上執行 -OVERKILL 時發生 COM 錯誤: {com_err}")
+        return False
+    except Exception as e:
+        print(f"❌ 在圖層 '{layer_name}' 上執行 -OVERKILL 時發生未知錯誤: {e}")
+        return False
+
+
+
+
+#%% get 讀取指定圖層資料
 
 start_time = time.time()  # ⏱️ 開始計時
 
@@ -186,7 +246,9 @@ if target_layers not in layer_names:
     print(f"❌ 圖層 '{target_layers}' 不存在於此圖檔中！")
     print(f"📋 可用圖層清單：{layer_names}")
     exit()
-    
+
+
+# overkill_success = run_overkill_on_layer(doc, target_layers)
 
 print("🔎 提取圖層資料中...")
 extractor = CADGeometryExtractor(doc, target_layers)
@@ -200,24 +262,32 @@ print(f"幾何提取完成，用時：{end_time - start_time:.2f} 秒")
 
 #%% 刪除被包含的線段
 
+
 def remove_contained_segments(geometry_dict, tol=0.01):
     """
-    刪除 LINE 裡，完全被另一條 LINE 包含的短線段。
-    geometry_dict: {"LINE":{handle:{"StartPoint":(x,y),"EndPoint":(x,y),...}}, "ARC":{...}}
-    tol:         比對公差
+    刪除 LINE 裡：
+      1. 自身長度 < tol 的退化線段
+      2. 完全被另一條 LINE 包含的短線段
+    geometry_dict: {"LINE":{handle:{"StartPoint":(x,y),"EndPoint":(x,y),"Length":...}}, "ARC":{...}}
+    tol:         公差 (同時作為退化長度閾值與包含判斷公差)
     回傳：新的 geometry_dict（LINE 已過濾）
     """
 
     def point_on_segment(p1, p2, q, tol):
         # 判斷點 q 是否落在 p1→p2 線段上（包含端點）
         dx, dy = p2[0]-p1[0], p2[1]-p1[1]
-        # 1) 共線性：cross ≈ 0
+        # 1) 共線性：cross≈0
         cross = dx*(q[1]-p1[1]) - dy*(q[0]-p1[0])
-        if abs(cross) > tol: 
+        # 用垂直距離判斷共線
+        seg_len = math.hypot(dx, dy)
+        if seg_len == 0:
             return False
-        # 2) 投影落在 [0, |p2-p1|^2]
+        dist = abs(cross) / seg_len
+        if dist > tol:
+            return False
+        # 2) 投影在端點範圍內
         dot = (q[0]-p1[0])*dx + (q[1]-p1[1])*dy
-        if dot < -tol or dot > dx*dx + dy*dy + tol:
+        if dot < -tol or dot > seg_len*seg_len + tol:
             return False
         return True
 
@@ -226,35 +296,37 @@ def remove_contained_segments(geometry_dict, tol=0.01):
         return point_on_segment(p1, p2, q1, tol) and point_on_segment(p1, p2, q2, tol)
 
     lines = geometry_dict["LINE"]
+
+    # --- 第一步：刪除自身長度 < tol 的退化線段 ---
+    for h, d in list(lines.items()):
+        if d["Length"] < tol:
+            lines.pop(h, None)
+
+    # --- 第二步：互相包含判斷 ---
     handles = list(lines.keys())
     to_remove = set()
 
-    # 兩兩比對：若 one 包含 two，就刪除較短的那條
     for i in range(len(handles)):
         h1 = handles[i]
+        if h1 in to_remove:
+            continue
         p1, p2 = lines[h1]["StartPoint"], lines[h1]["EndPoint"]
         L1 = lines[h1]["Length"]
+
         for h2 in handles[i+1:]:
-            if h1 in to_remove or h2 in to_remove:
-                # 已標記移除的，就跳過
+            if h2 in to_remove:
                 continue
             q1, q2 = lines[h2]["StartPoint"], lines[h2]["EndPoint"]
             L2 = lines[h2]["Length"]
 
             if segment_contains(p1, p2, q1, q2, tol):
-                # h2 完全包含在 h1
-                if L1 >= L2:
-                    to_remove.add(h2)
-                else:
-                    to_remove.add(h1)
+                # h2 在 h1 上
+                to_remove.add(h2 if L1 >= L2 else h1)
             elif segment_contains(q1, q2, p1, p2, tol):
-                # h1 完全包含在 h2
-                if L2 >= L1:
-                    to_remove.add(h1)
-                else:
-                    to_remove.add(h2)
+                # h1 在 h2 上
+                to_remove.add(h1 if L2 >= L1 else h2)
 
-    # 實際移除
+    # 實際移除被標記的短線段
     for h in to_remove:
         lines.pop(h, None)
 
@@ -264,8 +336,11 @@ def remove_contained_segments(geometry_dict, tol=0.01):
 
 
 
+
 geometry_dict = remove_contained_segments(geometry_dict)
 
+
+    
 #%% 刪除街廓內部不必要資訊
 
 def group_handles_by_endpoints(geometry_dict, tolerance=0.01):
@@ -393,7 +468,6 @@ def walk_maze_from_groups(groups, geometry_dict, tolerance=0.1):
         path = [current_handle]
         remaining_handles = set(sub_group) - {start_handle}  # 剩餘可用的Handle
         visited_points = {start_point, next_point}
-        
         returned_to_start = False
 
         while remaining_handles:
@@ -573,8 +647,6 @@ def draw_polyline(layer_name,polyline_path_list,  coor_df):
         bulges = []
             
         for i, handle in enumerate(polyline_handles):
-            # 移除 _r 後綴以映射回原始 handle
-            original_handle = handle.replace('_r', '')
             # 使用 coor_df 中的座標，而不是 geometry_dict，因為方向可能已反轉
             start_point, end_point = coor_df.loc[handle, 'Coordinate']
             bulge = coor_df.loc[handle, 'Bulge']
@@ -614,6 +686,7 @@ polyline_path_list = get_polyline_path_list(geometry_dict, threshold)
 now_str = datetime.now().strftime('%Y%m%d%H%M%S')
 layer_name = f"polyline_{now_str}"
 draw_polyline(layer_name,polyline_path_list,  coor_df)
+
 
 
  
@@ -672,7 +745,7 @@ def extract_polylines_from_layer(doc, layer_name):
 
 
 # layer_name = 'test20250429215447'
-# layer_name = 'test20250502155511'
+layer_name = 'polyline_20250507095026'
 print("🔎 讀取polyline中...")
 polylines = extract_polylines_from_layer(doc, layer_name)
 
@@ -695,108 +768,26 @@ def angle_between(v1, v2):
     theta = math.atan2(abs(cross), dot)
     return math.degrees(theta)
 
-def is_clockwise(points):
-    # 判斷多邊形頂點是否按順時針排列
-    total = 0
-    for i in range(len(points)-1):
-        x1,y1 = points[i]
-        x2,y2 = points[i+1]
-        total += (x2-x1)*(y2+y1)
-    return total > 0
-
-def get_tangent_at_point(start_point, end_point, bulge, at_start=True):
-    """
-    計算圓弧在端點的單位切線向量。
-    """
-    chord = math.hypot(end_point[0]-start_point[0], end_point[1]-start_point[1])
-    if chord < 1e-12 or abs(bulge) < 1e-6:
-        # 視為直線：起點切線方向=弦向量，終點切線方向=弦向量相反
-        vx,vy = end_point[0]-start_point[0], end_point[1]-start_point[1]
-        mag = math.hypot(vx, vy)
-        if mag<1e-12: return (0,0)
-        if at_start:
-            return (vx/mag, vy/mag)
-        else:
-            return (-vx/mag, -vy/mag)
-
-    # Bulge = tan(theta/4)
-    theta = 4 * math.atan(abs(bulge))
-    radius = chord / (2*math.sin(theta/2))
-    mid_x = (start_point[0]+end_point[0])/2
-    mid_y = (start_point[1]+end_point[1])/2
-    dx,dy  = end_point[0]-start_point[0], end_point[1]-start_point[1]
-    # 法向量方向取決於 bulge 正負
-    nx_,ny_ = (-dy, dx) if bulge>0 else (dy, -dx)
-    nmag = math.hypot(nx_, ny_)
-    nx_,ny_ = nx_/nmag, ny_/nmag
-    h = radius * math.cos(theta/2)
-    cx,cy = mid_x + nx_*h, mid_y + ny_*h  # 圓心
-    point = start_point if at_start else end_point
-    rx,ry = point[0]-cx, point[1]-cy
-    # 切線向量
-    tx,ty = (-ry, rx) if bulge>0 else (ry, -rx)
-    tmag = math.hypot(tx,ty)
-    return (tx/tmag, ty/tmag) if tmag>1e-12 else (0,0)
-
-def get_dynamic_bisector_length(points):
-    # 多邊形邊界框對角線 5%
-    xs = [p[0] for p in points]; ys = [p[1] for p in points]
-    diag = math.hypot(max(xs)-min(xs), max(ys)-min(ys))
-    return max(diag*0.05, 3)
-
-def calculate_angle_bisector(p1, p2, p3, bulge1, bulge2, points):
-    """
-    計算頂點 p2 處，p1-p2-p3 三點形成之角的角平分線，回傳 [起點, 終點]。
-    """
-    L = get_dynamic_bisector_length(points)
-    # 向量 v1 從 p2 指向 p1
-    if abs(bulge1)<1e-6:
-        v1 = (p1[0]-p2[0], p1[1]-p2[1])
-    else:
-        t1 = get_tangent_at_point(p1, p2, bulge1, at_start=False)
-        v1 = (-t1[0], -t1[1])
-    # 向量 v2 從 p2 指向 p3
-    if abs(bulge2)<1e-6:
-        v2 = (p3[0]-p2[0], p3[1]-p2[1])
-    else:
-        v2 = get_tangent_at_point(p2, p3, bulge2, at_start=True)
-
-    m1 = math.hypot(*v1); m2 = math.hypot(*v2)
-    if m1<1e-12 or m2<1e-12:
-        return [p2, p2]
-    u1, u2 = (v1[0]/m1, v1[1]/m1), (v2[0]/m2, v2[1]/m2)
-    bis = (u1[0]+u2[0], u1[1]+u2[1])
-    bmag = math.hypot(*bis)
-    if bmag<1e-12:
-        return [p2, p2]
-    bis = (bis[0]/bmag, bis[1]/bmag)
-
-    # 確保指向內部
-    test = (p2[0]+bis[0]*L*0.5, p2[1]+bis[1]*L*0.5)
-    try:
-        poly = Polygon(points)
-        if poly.is_valid and not poly.contains(Point(test)):
-            bis = (-bis[0], -bis[1])
-    except:
-        # fallback：使用繞行方向
-        cw = is_clockwise(points)
-        cross = u1[0]*u2[1] - u1[1]*u2[0]
-        if (cross<0 and not cw) or (cross>0 and cw):
-            bis = (-bis[0], -bis[1])
-
-    endpt = (p2[0]+bis[0]*L, p2[1]+bis[1]*L)
-    return [p2, endpt]
 
 #### ── 角度序列、分組函式 ─────────────────────────────────────────
 def dist(p1, p2):
     """計算兩點之間的距離"""
     return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
 
-
+# entries = coord_and_angles
+#找尋多邊形的角是「單一角度」、「倒角」、「圓弧」
 def find_consecutive_angle_runs(entries):
     angles = [entry[-1] for entry in entries]
-    all_same_angle = all(angle == angles[0] for angle in angles)
+    all_same_angle = all(angle == angles[0] for angle in angles) 
     
+    # 定義倒角角度容差
+    CHAMFER_ANGLE_TOL = 0.05
+    # 定義倒角距離容差
+    CHAMFER_DIST_TOL = 7
+    # 定義圓弧距離容差
+    ARC_DIST_TOL = 30
+
+    #所有角度都一樣  執行這邊
     if all_same_angle:
         n = len(entries)
         runs = []
@@ -821,54 +812,85 @@ def find_consecutive_angle_runs(entries):
                 runs.append([entries[i], entries[i+1]])
             else:
                 runs.append([entries[i]])  # 單獨成段
-   
-        return runs 
-    
+    #有各種不同的角度  執行這邊
     else:
         runs = []
         cur = [entries[0]]
         for prev, curr in zip(entries, entries[1:]):
             spatial_dist = dist(curr[1], prev[1])
             angle_diff = abs(curr[-1] - prev[-1])
-            if spatial_dist < 20 and angle_diff < 0.05:
-                cur.append(curr)
+            #圓弧判斷
+            if prev[3] or curr[3]:
+                #距離小於一定長度就判斷為一組
+                if spatial_dist < ARC_DIST_TOL :
+                    cur.append(curr)
+                else:
+                    runs.append(cur); cur=[curr]
+            #倒角判斷        
             else:
-                runs.append(cur); cur=[curr]
+                if spatial_dist < CHAMFER_DIST_TOL or angle_diff < CHAMFER_ANGLE_TOL:
+                   cur.append(curr)
+                else:
+                    runs.append(cur); cur=[curr]
+                    
         runs.append(cur)
-        # 合併首尾同角度
-        if len(runs)>1 and runs[0][0][-1]==runs[-1][0][-1] or abs(runs[0][0][-1] - runs[-1][0][-1]) < 0.05:
-            runs[0] = runs[-1]+runs[0]
-            runs.pop()
-            
-        i = 0
-        while i < len(runs):
-            run = runs[i]
-            # 只處理「只有一個 entry 的那種 run」
-            if len(run) == 1 and len(runs) > 1:
-                angle = run[0][-1]
-                prev_i = (i - 1) % len(runs)
-                next_i = (i + 1) % len(runs)
-                prev_angle = runs[prev_i][0][-1]
-                next_angle = runs[next_i][0][-1]
         
-                # 如果跟前一組角度差小於 12，就合併到前一組
-                if abs(angle - prev_angle) < 12:
-                    runs[prev_i].extend(run)
-                    runs.pop(i)
-                    # 如果我們合併的是第一組，i 不動，否則回退一格以檢查新合併後的前一組
-                    if i > prev_i:
-                        i -= 1
-                    continue
-        
-                # 否則如果跟下一組角度差小於 12，就合併到下一組
-                if abs(angle - next_angle) < 12:
-                    runs[next_i] = run + runs[next_i]
-                    runs.pop(i)
-                    # 因為我們把當前 i 合併到下一組，所以不必改 i
-                    continue
-        
-            i += 1
-        return runs
+        # 判斷首尾是否為一對
+        if len(runs)>1:
+            spatial_dist = dist(runs[0][0][1], runs[-1][0][1])
+            #圓弧判斷
+            if runs[0][0][3] or runs[-1][0][3]:                
+                if spatial_dist < ARC_DIST_TOL :
+                    runs[0] = runs[-1]+runs[0]
+                    runs.pop()
+            elif spatial_dist < CHAMFER_DIST_TOL or abs(runs[0][0][-1] - runs[-1][0][-1]) < CHAMFER_ANGLE_TOL:
+                runs[0] = runs[-1]+runs[0]
+                runs.pop()
+    
+    #判斷如果有2個以上組合一組的，優先保留角度接近的，再保留距離接近的
+    processed_runs = []
+    for run in runs:
+        # 只有當這個 run 裡面元素為3 才要進行二階段過濾
+        if len(run) == 3:
+            pair = None
+    
+            # 一階段：找角度差很小的 pair
+            for i in range(len(run)):
+                for j in range(i+1, len(run)):
+                    if abs(run[i][-1] - run[j][-1]) < CHAMFER_ANGLE_TOL:
+                        pair = [run[i], run[j]]
+                        break
+                if pair:
+                    break
+    
+            # 二階段：若沒在角度上一階段找到，就再檢查空間距離
+            if not pair:
+                for i in range(len(run)):
+                    for j in range(i+1, len(run)):
+                        if dist(run[i][1], run[j][1]) < CHAMFER_DIST_TOL:
+                            pair = [run[i], run[j]]
+                            break
+                    if pair:
+                        break
+    
+            # 如果確實找到一對，就只保留那兩筆
+            if pair:
+                processed_runs.append(pair)
+            else:
+                # 如果連距離也沒配對到，可依需求：
+                # 1) 保留整個 run： processed_runs.append(run)
+                # 2) 或者直接丟棄： pass
+                processed_runs.append(run)
+    
+        else:
+            # 少於或等於兩筆的 run，原封不動
+            processed_runs.append(run)
+    
+    # 最終把 runs 換成處理過的結果
+    runs = processed_runs
+    
+
+    return runs
 
 
 def chunk_pairs(run):
@@ -884,7 +906,7 @@ def chunk_pairs(run):
 # degree_min = 60
 # degree_max = 110
 def select_corner_pairs(entries, degree_min, degree_max):
-    eps = 2
+    eps = 5
     entries = [e for e in entries if abs(e[-1] - 180) > eps]  #175~185度的都先移除
     
     runs = find_consecutive_angle_runs(entries)
@@ -908,28 +930,33 @@ def select_corner_pairs(entries, degree_min, degree_max):
         result = [[e] for e in entries if degree_min <= e[-1] <= degree_max]
         # 返回符合角度條件的單個角點列表 (扁平列表)
         
-    
-    filtered = []
-    for group in result:
-        # 如果這個 group 裡所有的角度都 ≤ 160，就保留
-        if all(e[-1] <= 160 for e in group):
-            filtered.append(group)
-            
-    if len(filtered) > 4:
-        # (最小角度, 原始索引)
-        min_angles = [
-            (min(e[-1] for e in grp), idx)
-            for idx, grp in enumerate(filtered)
-        ]
-        # 取出角度最小的 4 條記錄
-        smallest = heapq.nsmallest(4, min_angles, key=lambda x: x[0])
-        # 按原始索引排序
-        keep_idxs = [idx for _, idx in sorted(smallest, key=lambda x: x[1])]
-        # 重建 filtered
-        filtered = [filtered[i] for i in keep_idxs]
+    if len(result) != 4:
+        filtered = []
+        for group in result:
+            # 如果這個 group 裡所有的角度都 ≤ 160，就保留
+            if all(e[-1] <= 160 for e in group):
+                filtered.append(group)
+        
+        #若組數超過4組就保留角度較小的4組
+        if len(filtered) > 4:
+            # (最小角度, 原始索引)
+            min_angles = [
+                (min(e[-1] for e in grp), idx)
+                for idx, grp in enumerate(filtered)
+            ]
+            # 取出角度最小的 4 條記錄
+            smallest = heapq.nsmallest(4, min_angles, key=lambda x: x[0])
+            # 按原始索引排序
+            keep_idxs = [idx for _, idx in sorted(smallest, key=lambda x: x[1])]
+            # 重建 filtered
+            filtered = [filtered[i] for i in keep_idxs]
+        
+        return filtered 
+    else:
+        return result 
         
     
-    return filtered 
+    
 
      
 
@@ -1129,9 +1156,9 @@ def get_intersections_points(intersection_and_angle_dict):
         next_key = (i + 1) % n  
         
         #射線1座標, 射線交點座標, 射線3座標, 角度
-        prev_point_1, prev_point_2, prev_point_3, prev_θ = intersection_and_angle_dict[prev_key]
-        curr_point_1, curr_point_2, curr_point_3, curr_θ = intersection_and_angle_dict[curr_key]
-        next_point_1, next_point_2, next_point_3, next_θ = intersection_and_angle_dict[next_key]
+        prev_point_1, prev_point_2, prev_point_3, prev_θ, _ = intersection_and_angle_dict[prev_key]
+        curr_point_1, curr_point_2, curr_point_3, curr_θ, curr_sub_corner_run = intersection_and_angle_dict[curr_key]
+        next_point_1, next_point_2, next_point_3, next_θ, _ = intersection_and_angle_dict[next_key]
         
         #射線單位向量
         prev_unit_ray = angle_bisector_direction(prev_point_1, prev_point_2, prev_point_3)
@@ -1147,15 +1174,16 @@ def get_intersections_points(intersection_and_angle_dict):
         
         mid_point = [(curr_point_1[0]+curr_point_3[0])/2, (curr_point_1[1]+curr_point_3[1])/2]
         
-        if t2_prev > t2_next:
-            intersection_data = [(curr_key, next_key), curr_point_2, intersection_next, curr_unit_ray, mid_point, t1_curr, t2_next]
+        # if t2_prev > t2_next:
+        if t1_curr > t2_curr:
+            intersection_data = [(curr_key, next_key), curr_point_2, intersection_next, curr_unit_ray, mid_point, t1_curr, t2_next, curr_sub_corner_run]
         else:
-            intersection_data = [(curr_key, prev_key), curr_point_2, intersection_prev, curr_unit_ray, mid_point, t2_curr, t2_prev]
+            intersection_data = [(curr_key, prev_key), curr_point_2, intersection_prev, curr_unit_ray, mid_point, t2_curr, t2_prev, curr_sub_corner_run]
             
         intersections.append(intersection_data)
        
     return intersections  #[與第幾個點相交的 key, 切線交點, 兩射線在polyline交點, 射線單位向量, 中點
-                          #自己切線交點到內部交點的長度, 相交點切線交點到內部交點的長度]
+                          #自己切線交點到內部交點的長度, 相交點切線交點到內部交點的長度, 當前的sub_corner_run]
 
 
 # intersections_list = intersections
@@ -1195,6 +1223,7 @@ def pair_intersections(intersections_list):
         current_intersection_point = current_data[2]
         current_len_from_curr = current_data[5] # 自己切線交點到內部交點的長度
         current_len_from_target = current_data[6] # 相交點切線交點到內部交點的長度
+        current_sub_corner_run = current_data[-1] #當前的corner_run
 
         # 嘗試尋找理論上的配對夥伴 (target_key, curr_key)
         # 它的 curr_key 應該是我們的 initial_target_key
@@ -1207,7 +1236,6 @@ def pair_intersections(intersections_list):
             # 檢查找到的夥伴是否確實是 initial_target_key 開頭
             if partner_key != initial_target_key:
                  # 理論上 key_to_index 應該保證這一點，但加個檢查更安全
-                 print(f"警告：索引 {i} ({curr_key}, {initial_target_key}) 尋找夥伴 {initial_target_key} 時，在索引 {expected_partner_index} 找到的卻是鍵 {partner_key} 開頭的資料。跳過配對。")
                  continue
 
             # 情況一：完美配對 (e.g., (1, 2) 找到了 (2, 1))
@@ -1228,31 +1256,38 @@ def pair_intersections(intersections_list):
                     partner_data[3],                    # 保留夥伴自己的射線向量
                     partner_data[4],                    # 保留夥伴自己的中點
                     current_len_from_target,            # 夥伴到交點的距離 = current 到交點的距離 (來自 current_data 的第 7 個元素)
-                    current_len_from_curr             # current 到交點的距離 = 夥伴到交點的距離 (來自 current_data 的第 6 個元素)
+                    current_len_from_curr,             # current 到交點的距離 = 夥伴到交點的距離 (來自 current_data 的第 6 個元素)
+                    partner_data[-1]
                 ]
                 paired_results.append(current_data)
                 paired_results.append(modified_partner_data)
                 paired_indices.add(i)
                 paired_indices.add(expected_partner_index) # 標記原始夥伴索引已使用
 
-        else:
-            # 找不到夥伴或夥伴已被配對
-            if expected_partner_index is None:
-                 print(f"警告：索引 {i} ({curr_key}, {initial_target_key}) 找不到鍵為 {initial_target_key} 的夥伴資料。")
-            else:
-                 print(f"警告：索引 {i} ({curr_key}, {initial_target_key}) 的預期夥伴索引 {expected_partner_index} 已被配對。")
-            # 可以選擇將未配對的 current_data 加入結果，或完全忽略
-            # modified_partner_data = [
-            #     ('-', '-'),            # 修正 key
-            #     current_data[1],                    # 保留夥伴自己的切線交點
-            #     intersections_list[0][2],         # 使用 current_data 的交點
-            #     current_data[3],                    # 保留夥伴自己的射線向量
-            #     current_data[4],                    # 保留夥伴自己的中點
-            #     current_len_from_target,            # 夥伴到交點的距離 = current 到交點的距離 (來自 current_data 的第 7 個元素)
-            #     current_len_from_curr             # current 到交點的距離 = 夥伴到交點的距離 (來自 current_data 的第 6 個元素)
-            # ]
-            # paired_results.append(modified_partner_data) # 如果需要保留未配對的項目
 
+    #尚未配對的index(處理(1,2)、(2,1)、「(0,1)、(3,2)」情況)
+    unpaired = [i for i in range(n) if i not in paired_indices]
+    if len(unpaired) == 2:
+        curr = intersections_list[i]
+        curr_key, targ_key = curr[0]
+
+        # 自行合成一筆反向 partner
+        # shallow copy 一份原資料
+        partner = curr.copy()
+        # 修改 key tuple
+        partner[0] = (targ_key, curr_key)
+        # 交叉用同一個 intersection_point
+        partner[2] = curr[2]
+        # 把距離互換，讓 partner[5] 是自己到交點、partner[6] 是 curr 到交點
+        partner[5], partner[6] = curr[6], curr[5]
+        # 其他欄位（射線向量、中點、run…）都沿用 curr 的
+
+        # 把它們加進結果
+        paired_results.append(curr)
+        paired_results.append(partner)
+        paired_indices.add(i)
+        
+        
     # 檢查是否所有項目都被配對了
     if len(paired_indices) != n:
         print(f"警告：並非所有交點資料都成功配對。預期 {n} 個，實際配對 {len(paired_indices)} 個。")
@@ -1334,7 +1369,9 @@ def draw_corner_lines(doc, path, corner_runs, intersections, layer_name):
             
     poly_ent = doc.HandleToObject(path['handle'])
     for key, run in enumerate(corner_runs):
-        intersections_data = intersections[key]
+        # intersections_data = intersections[key]
+        # print(run)
+        intersections_data = next((entry for entry in intersections if entry[-1] == run), None)
         mid = intersections_data[4]       # bisector 起點
         end = intersections_data[2]       # bisector 原本的終點（垂足／平分足）
         ux, uy = intersections_data[3]    # bisector 方向
@@ -1393,9 +1430,9 @@ def draw_corner_lines(doc, path, corner_runs, intersections, layer_name):
             p_prev, p_cur, p_next, bulge, angle = run[0]
 
             # 找 idx
-            i = next((j for j in range(m) if pts[j]==p_cur), None)
-            if i is None:
-                continue
+            # i = next((j for j in range(m) if pts[j]==p_cur), None)
+            # if i is None:
+            #     continue
 
             # 起點就是 p_cur
             start_pt = p_cur
@@ -1465,26 +1502,26 @@ for path in polylines:
         for i in range(len(corner_runs)):
             sub_corner = corner_runs[i]   
             prev_point, intersection_point, next_point, θ = get_one_line_intersection(sub_corner)
-            intersection_and_angle_dict[i] = [prev_point, intersection_point, next_point, θ]
+            intersection_and_angle_dict[i] = [prev_point, intersection_point, next_point, θ, sub_corner]
     #全都是單一個一組(各個角都是單一角)
     elif all(len(run) == 1 for run in corner_runs):
         for i, sub_corner in enumerate(corner_runs):
             θ = get_single_angle(sub_corner)
-            intersection_and_angle_dict[i] = [sub_corner[0][0], sub_corner[0][1], sub_corner[0][2], θ] 
+            intersection_and_angle_dict[i] = [sub_corner[0][0], sub_corner[0][1], sub_corner[0][2], θ, sub_corner] 
     #包含「圓弧及單一角」或「倒角及單一角」
     else:
         for i, sub_corner in enumerate(corner_runs):
             if len(sub_corner) == 2:
                 prev_point, intersection_point, next_point, θ = get_one_line_intersection(sub_corner)
-                intersection_and_angle_dict[i] = [prev_point, intersection_point, next_point, θ]
+                intersection_and_angle_dict[i] = [prev_point, intersection_point, next_point, θ, sub_corner]
             elif len(sub_corner) == 1:
                 θ = get_single_angle(sub_corner)
-                intersection_and_angle_dict[i] = [sub_corner[0][0], sub_corner[0][1], sub_corner[0][2], θ] 
+                intersection_and_angle_dict[i] = [sub_corner[0][0], sub_corner[0][1], sub_corner[0][2], θ, sub_corner] 
  
     #取得角平分線射線的交點
     intersections = get_intersections_points(intersection_and_angle_dict)
     intersections = pair_intersections(intersections)
-    a.append(coord_and_angles)
+    a.append(corner_runs)
     # 3. 繪製所有角線
     drawn_lines = draw_corner_lines(doc, path, corner_runs, intersections, layer_name)
     bisector_dict[handle] = drawn_lines
@@ -2102,8 +2139,8 @@ def batch_offset_polylines(
 
     for info in polylines_info:
         ent = doc.HandleToObject(info['handle'])
-        h = info['handle']
-        print(h)
+        # h = info['handle']
+        # print(h)
         # 計算偏移距離清單
         offsets = ([offset_dist+width/2, offset_dist-width/2, offset_dist]
                    if width>0 else [offset_dist])
@@ -2125,7 +2162,6 @@ def batch_offset_polylines(
             half = square_width/2
             for ne in centers:
                 if not hasattr(ne,'Coordinates'):
-                    print('111')
                     continue
                 arr  = list(ne.Coordinates)
                 pts2 = [(arr[i*2],arr[i*2+1]) for i in range(len(arr)//2)]
