@@ -1658,7 +1658,7 @@ for i, poly in enumerate(polys): # 假設 polys 是 Polygon 物件列表
 street_region = unary_union(valid_polys)
 
 #取得最外框
-gap_tol = 20.0     # 根據道路寬度來調整，單位同你的座標
+gap_tol = 100.0     # 根據道路寬度來調整，單位同你的座標
 flooded = street_region.buffer(gap_tol)
 outer = flooded.buffer(-gap_tol)
 
@@ -1807,15 +1807,12 @@ print('-'*50)
 print("🔎 繪製街廓邊緣到交叉路口連線中...")
 print('-'*50)
 
-connect_boundary_to_endpoints(doc, boundary_points, endpoints, layer_name = 'bisector_line', max_dist=20)
+connect_boundary_to_endpoints(doc, boundary_points, endpoints, layer_name = 'bisector_line', max_dist=30)
 
 
 
 
 #%% 提取 bisector_line 圖層的線段
-
-
-print("🔎 從 bisector_line 圖層提取線段並傳給 unary_union...")
 
 from shapely.geometry import LineString, MultiLineString
 from shapely.ops import unary_union, split, polygonize  # 明確導入 split
@@ -2203,6 +2200,41 @@ def is_clockwise(points):
 
 
 
+def approximate_arc(start, end, bulge, num_segments=50):
+    """
+    將帶有 bulge 的線段轉換為弧形，通過計算圓弧上的點來近似。
+    start, end: (x, y)
+    bulge: bulge 值
+    num_segments: 切分精度
+    回傳：近似弧的點列表 (含 start 不含 end)
+    """
+    import math
+    if abs(bulge) < 1e-6:
+        return [start]
+    dx, dy = end[0]-start[0], end[1]-start[1]
+    chord = math.hypot(dx, dy)
+    theta = 4 * math.atan(abs(bulge))
+    radius = chord / (2 * math.sin(theta/2))
+    mx, my = (start[0]+end[0])/2, (start[1]+end[1])/2
+    nx, ny = -dy, dx
+    if bulge < 0:
+        nx, ny = -nx, -ny
+    d = math.hypot(nx, ny)
+    nx, ny = nx/d, ny/d
+    h = radius * math.cos(theta/2)
+    cx, cy = mx + nx*h, my + ny*h
+
+    start_ang = math.atan2(start[1]-cy, start[0]-cx)
+    # 角度增量
+    delta = theta if bulge >= 0 else -theta
+
+    pts = []
+    for i in range(num_segments):
+        ang = start_ang + delta * i/num_segments
+        pts.append((cx + radius*math.cos(ang),
+                    cy + radius*math.sin(ang)))
+    return pts
+
 
 def batch_offset_polylines(
     doc,
@@ -2272,48 +2304,6 @@ def batch_offset_polylines(
                 continue
 
         # 在偏移後中心線各頂點決定是否繪製集水井
-        # if square_width>0:
-        #     half = square_width/2
-        #     for ne in centers:
-        #         if not hasattr(ne,'Coordinates'):
-        #             continue
-        #         arr  = list(ne.Coordinates)
-        #         pts2 = [(arr[i*2],arr[i*2+1]) for i in range(len(arr)//2)]
-        #         for j,(cx,cy) in enumerate(pts2):
-        #             # 計算前後夾角
-        #             p_prev = pts2[j-1] if j>0 else pts2[-1]
-        #             p_next = pts2[j+1] if j<len(pts2)-1 else pts2[0]
-        #             ang = vertex_angle(p_prev,(cx,cy),p_next)
-        #             if ang is None: continue
-        #             # 角度範圍檢查
-        #             if not (draw_junction_angle[0] <= ang <= draw_junction_angle[1]):
-        #                 continue
-        #             # 取 bulge 並決定向量
-        #             bulge = 0
-        #             if ent.ObjectName=='AcDbPolyline':
-        #                 try: bulge = ne.GetBulge(j)
-        #                 except: bulge=0
-        #             if bulge!=0 and j>0:
-        #                 dx = cx - pts2[j-1][0]
-        #                 dy = cy - pts2[j-1][1]
-        #             else:
-        #                 nx_,ny_ = pts2[(j+1)%len(pts2)]
-        #                 dx = nx_-cx; dy = ny_-cy
-
-        #             # 標準化
-        #             L = math.hypot(dx,dy)
-        #             if L<1e-6: dx,dy=1,0
-        #             else: dx/=L; dy/=L
-        #             angle = math.atan2(dy,dx)
-
-        #             # 繪製集水井
-        #             draw_catch_basin(
-        #                 ms, cx, cy,
-        #                 angle, half,
-        #                 insetsize, dst_layer
-        #             )
-        #             square_count += 1
-        # 在偏移後中心線各頂點決定是否繪製集水井
         if square_width > 0:
             half = square_width / 2
             for ne in centers:
@@ -2324,32 +2314,104 @@ def batch_offset_polylines(
 
                 # 遍歷每對相鄰點，檢查線段長度並添加集水井
                 for j in range(len(pts2)):
+                    # p1 = pts2[j]
+                    # p2 = pts2[(j+1) % len(pts2)] if j < len(pts2) - 1 else pts2[0]
+
+                    # # 計算線段長度
+                    # segment_length = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                    
+                    
+                    # if catch_basin_interval is not None:
+                    #     # 計算需要添加的集水井數量（不包括端點）
+                    #     num_catch_basins = int(segment_length // catch_basin_interval)
+                
+                    #     # 如果需要添加集水井，計算間隔並插值
+                    #     if num_catch_basins > 0:
+                    #         interval = segment_length / (num_catch_basins + 1)
+                    #         dx = p2[0] - p1[0]
+                    #         dy = p2[1] - p1[1]
+                    #         angle = math.atan2(dy, dx)
+                
+                    #         for k in range(1, num_catch_basins + 1):
+                    #             t = (k * interval) / segment_length
+                    #             cx = p1[0] + t * dx
+                    #             cy = p1[1] + t * dy
+                    #             draw_catch_basin(
+                    #                 ms, cx, cy,
+                    #                 angle, half,
+                    #                 insetsize, dst_layer
+                    #             )
+                    #             square_count += 1
+                    # 放在 for j in range(len(pts2)) 的迴圈內
                     p1 = pts2[j]
                     p2 = pts2[(j+1) % len(pts2)] if j < len(pts2) - 1 else pts2[0]
-
-                    # 計算線段長度
-                    segment_length = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
                     
-                    # 計算需要添加的集水井數量（不包括端點）
-                    num_catch_basins = int(segment_length // catch_basin_interval)
+                    # 計算 bulge
+                    bulge = 0
+                    if ent.ObjectName == 'AcDbPolyline':
+                        try:
+                            bulge = ne.GetBulge(j)
+                        except:
+                            bulge = 0
                     
-                    # 如果需要添加集水井，計算間隔並插值
-                    if num_catch_basins > 0:
-                        interval = segment_length / (num_catch_basins + 1)
-                        dx = p2[0] - p1[0]
-                        dy = p2[1] - p1[1]
-                        angle = math.atan2(dy, dx)
+                    # 如果有設定 catch_basin_interval，才做自動插值
+                    if catch_basin_interval is not None:
+                        if abs(bulge) < 1e-9:
+                            # —— 直線段：跟原本一樣 —— 
+                            segment_length = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                            num_cbs = int(segment_length // catch_basin_interval)
+                            if num_cbs > 0:
+                                interval = segment_length / (num_cbs + 1)
+                                dx = p2[0] - p1[0]; dy = p2[1] - p1[1]
+                                angle = math.atan2(dy, dx)
+                                for k in range(1, num_cbs + 1):
+                                    t = (k * interval) / segment_length
+                                    cx = p1[0] + t * dx
+                                    cy = p1[1] + t * dy
+                                    draw_catch_basin(ms, cx, cy, angle, half, insetsize, dst_layer)
+                                    square_count += 1
+                        else:
+                            # —— 弧線段：先攤平，再依弧長等距插值 —— 
+                            arc_pts = approximate_arc(p1, p2, bulge, num_segments=50)
+                            # arc_pts 內含從 p1 到接近 p2 的一串點，最後才加上 p2
+                            arc_pts.append(p2)
+                    
+                            # 計算整條弧長
+                            arc_lengths = []
+                            total_arc_length = 0.0
+                            for a, b in zip(arc_pts, arc_pts[1:]):
+                                d = math.hypot(b[0]-a[0], b[1]-a[1])
+                                arc_lengths.append(d)
+                                total_arc_length += d
+                    
+                            num_cbs = int(total_arc_length // catch_basin_interval)
+                            if num_cbs > 0:
+                                # 每個洞之間的距離
+                                target_ds = [k * catch_basin_interval for k in range(1, num_cbs+1)]
+                    
+                                # 沿著 arc_pts 找到每個 target_d 所在的 segment
+                                cum = 0.0
+                                idx = 0
+                                for td in target_ds:
+                                    # 移動 idx，找到 cum+arc_lengths[idx] >= td
+                                    while idx < len(arc_lengths) and cum + arc_lengths[idx] < td:
+                                        cum += arc_lengths[idx]
+                                        idx += 1
+                                    if idx >= len(arc_lengths):
+                                        break
+                                    # 在 arc_pts[idx] 到 arc_pts[idx+1] 之間插值
+                                    a = arc_pts[idx]
+                                    b = arc_pts[idx+1]
+                                    seg_d = arc_lengths[idx]
+                                    t = (td - cum) / seg_d
+                                    cx = a[0] + t * (b[0] - a[0])
+                                    cy = a[1] + t * (b[1] - a[1])
+                                    # 方向取切線方向
+                                    dx = b[0] - a[0]; dy = b[1] - a[1]
+                                    ang = math.atan2(dy, dx)
+                                    draw_catch_basin(ms, cx, cy, ang, half, insetsize, dst_layer)
+                                    square_count += 1
 
-                        for k in range(1, num_catch_basins + 1):
-                            t = (k * interval) / segment_length
-                            cx = p1[0] + t * dx
-                            cy = p1[1] + t * dy
-                            draw_catch_basin(
-                                ms, cx, cy,
-                                angle, half,
-                                insetsize, dst_layer
-                            )
-                            square_count += 1
 
                     # 原有邏輯：在頂點處繪製集水井（根據角度）
                     cx, cy = p1
