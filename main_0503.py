@@ -249,8 +249,9 @@ if target_layers not in layer_names:
 
 
 # overkill_success = run_overkill_on_layer(doc, target_layers)
-
+print('-'*50)
 print("🔎 提取圖層資料中...")
+print('-'*50)
 extractor = CADGeometryExtractor(doc, target_layers)
 extractor.extract()
 geometry_dict = extractor.get_geometry()
@@ -672,8 +673,9 @@ def draw_polyline(layer_name,polyline_path_list,  coor_df):
     
         polyline.Update()
         
-
+print('-'*50)
 print("🔎 建立polyline中...")
+print('-'*50)
 threshold = 1e-6
 
 #取得handle座標df
@@ -746,7 +748,9 @@ def extract_polylines_from_layer(doc, layer_name):
 
 # layer_name = 'test20250429215447'
 layer_name = 'polyline_20250507095026'
+print('-'*50)
 print("🔎 讀取polyline中...")
+print('-'*50)
 polylines = extract_polylines_from_layer(doc, layer_name)
 
 
@@ -1457,7 +1461,11 @@ def draw_corner_lines(doc, path, corner_runs, intersections, layer_name):
 
 
 # ── 執行範例 ──────────────────────────────────────────────────
+print('-'*50)
 print("🔎 繪製角平分線中...")
+print('-'*50)
+
+
 layer_name = f'bisector_line'
 
 bisector_dict = {}
@@ -1548,54 +1556,61 @@ from shapely.geometry import LineString as ShapelyLine, Point
 import win32com.client
 from shapely.ops import linemerge, snap
 
-def bulge_to_arc(p1, p2, bulge, segments):
+
+
+def approximate_arc(start, end, bulge, num_segments=50):
     """
-    將一段帶 bulge 的圓弧，近似成多個線段。
-    p1, p2: (x,y)
-    bulge = tan(theta/4)，theta = sweep angle
-    segments: 切分細緻度，bulge 越大可加大
-    回傳一系列點（含起點，不含終點）
+    將帶有 bulge 的線段轉換為弧形，通過計算圓弧上的點來近似。
+    start, end: 線段的起點和終點，(x, y)
+    bulge: bulge 值，表示弧的凸度
+    num_segments: 弧分段數，用於近似
+    返回：近似弧的點列表
     """
-    if abs(bulge) < 1e-9:
-        # 直線段：只回傳起點
-        return [p1]
+    # 如果 bulge 為 0，則為直線
+    if abs(bulge) < 1e-6:
+        return [start, end]
 
-    # 計算弦長與中央角
-    dx, dy = p2[0]-p1[0], p2[1]-p1[1]
-    chord = (dx*dx + dy*dy)**0.5
-    theta = 4 * atan(bulge)  # sweep angle
-    radius = chord / (2*sin(theta/2))
+    chord_length = math.sqrt((end[0] - start[0])**2 + (end[1] - start[1])**2)
+    if chord_length < 1e-6:  # 避免起點和終點重合
+        return [start, end]
 
-    # 圓心
-    # 中點
-    mx, my = (p1[0]+p2[0])/2, (p1[1]+p2[1])/2
-    # 法向量方向
-    nx, ny = -dy, dx
-    if bulge < 0: 
-        nx, ny = -nx, -ny
-    # normalize
-    d = (nx*nx+ny*ny)**0.5
-    nx, ny = nx/d, ny/d
-    # h = distance from chord-mid to center
-    h = radius * cos(theta/2)
-    cx, cy = mx + nx*h, my + ny*h
+    theta = 4 * math.atan(abs(bulge))
+    # 確保 theta 不會導致 sin(theta/2) 為 0（雖然已檢查 bulge，但為安全起見）
+    if abs(theta) < 1e-6:
+        return [start, end]
 
-    # 起訖角度
-    import math
-    ang1 = math.atan2(p1[1]-cy, p1[0]-cx)
-    ang2 = ang1 + theta
+    radius = chord_length / (2 * math.sin(theta / 2))
+    mid_x = (start[0] + end[0]) / 2
+    mid_y = (start[1] + end[1]) / 2
+    direction = 1 if bulge >= 0 else -1
+    height = radius * math.cos(theta / 2)
+    chord_vec_x = (end[0] - start[0]) / chord_length
+    chord_vec_y = (end[1] - start[1]) / chord_length
+    perp_vec_x = -chord_vec_y * direction
+    perp_vec_y = chord_vec_x * direction
+    center_x = mid_x + perp_vec_x * height
+    center_y = mid_y + perp_vec_y * height
+    center = (center_x, center_y)
 
-    pts = []
-    for i in range(segments):
-        t = ang1 + (theta * i/segments)
-        pts.append((cx + radius*cos(t), cy + radius*sin(t)))
-    return pts
+    start_angle = math.atan2(start[1] - center_y, start[0] - center_x)
+    end_angle = math.atan2(end[1] - center_y, end[0] - center_x)
 
+    if bulge >= 0:
+        if end_angle < start_angle:
+            end_angle += 2 * math.pi
+    else:
+        if start_angle < end_angle:
+            start_angle += 2 * math.pi
 
-# pl = polylines[1]
-# points = pl['points']
-# bulges = pl['bulges']
-# closed = pl['closed']
+    arc_points = []
+    for i in range(num_segments + 1):
+        t = i / num_segments
+        angle = start_angle + (end_angle - start_angle) * t
+        x = center_x + radius * math.cos(angle)
+        y = center_y + radius * math.sin(angle)
+        arc_points.append((x, y))
+
+    return arc_points
 
 def polyline_to_polygon(points, bulges, closed, arc_segments):
     """
@@ -1611,9 +1626,13 @@ def polyline_to_polygon(points, bulges, closed, arc_segments):
     for i in range(n-1 if not closed else n):
         p1 = points[i]
         p2 = points[(i+1)%n]
-        b  = bulges[i]
-        arc = bulge_to_arc(p1, p2, b, segments=arc_segments)
-        ring_pts.extend(arc)
+        b = bulges[i]
+        arc = approximate_arc(p1, p2, b, arc_segments)
+        # 避免重複點（除了閉合時的最後一點）
+        if i < (n-1 if not closed else n-1):
+            ring_pts.extend(arc[:-1])  # 排除最後一點，因為下一個弧的起點會重複
+        else:
+            ring_pts.extend(arc)
     # 保證最後回到起點
     if ring_pts[0] != ring_pts[-1]:
         ring_pts.append(ring_pts[0])
@@ -1622,6 +1641,9 @@ def polyline_to_polygon(points, bulges, closed, arc_segments):
     return Polygon(lr)
 
 
+print('-'*50)
+print("🔎 繪製道路中心線中...")
+print('-'*50)
 
 polys = []
 for pl in polylines:
@@ -1630,13 +1652,15 @@ for pl in polylines:
 
 # 2. 合併所有塊狀區域
 valid_polys = []
-invalid_handles = []
 for i, poly in enumerate(polys): # 假設 polys 是 Polygon 物件列表
     valid_polys.append(poly)
 
 street_region = unary_union(valid_polys)
 
-outer = street_region.convex_hull
+#取得最外框
+gap_tol = 20.0     # 根據道路寬度來調整，單位同你的座標
+flooded = street_region.buffer(gap_tol)
+outer = flooded.buffer(-gap_tol)
 
 roads = outer.difference(street_region)
 
@@ -1647,12 +1671,12 @@ center_line = Centerline(roads, interpolation_distance=1) # 直接傳入 Shapely
 road_skeleton = center_line.geometry
 
 
-
+# skeleton= road_skeleton
 def draw_skeleton_as_polylines(
     doc,
     skeleton,
     layer_name,
-    min_length=30,
+    min_length,
     tolerance=0.1  # snap 容差
 ):
     """
@@ -1722,9 +1746,8 @@ endpoints = draw_skeleton_as_polylines(
     doc,
     road_skeleton,
     layer_name="road_central_line",
-    min_length=30 #只取大於30m的線
+    min_length=0 #只取大於30m的線
 )
-
 
 
 
@@ -1780,6 +1803,10 @@ def connect_boundary_to_endpoints(
     print(f"✅ 已在圖層「{layer_name}」連出了 {count} 條距離 ≤ {max_dist}m 的線段。")
 
 # ===== 使用範例 =====
+print('-'*50)
+print("🔎 繪製街廓邊緣到交叉路口連線中...")
+print('-'*50)
+
 connect_boundary_to_endpoints(doc, boundary_points, endpoints, layer_name = 'bisector_line', max_dist=20)
 
 
@@ -1792,6 +1819,54 @@ print("🔎 從 bisector_line 圖層提取線段並傳給 unary_union...")
 
 from shapely.geometry import LineString, MultiLineString
 from shapely.ops import unary_union, split, polygonize  # 明確導入 split
+
+
+def bulge_to_arc(p1, p2, bulge, segments):
+    """
+    將一段帶 bulge 的圓弧，近似成多個線段。
+    p1, p2: (x,y)
+    bulge = tan(theta/4)，theta = sweep angle
+    segments: 切分細緻度，bulge 越大可加大
+    回傳一系列點（含起點，不含終點）
+    """
+    if abs(bulge) < 1e-9:
+        # 直線段：只回傳起點
+        return [p1]
+
+    # 計算弦長與中央角
+    dx, dy = p2[0]-p1[0], p2[1]-p1[1]
+    chord = (dx*dx + dy*dy)**0.5
+    theta = 4 * atan(bulge)  # sweep angle
+    radius = chord / (2*sin(theta/2))
+
+    # 圓心
+    # 中點
+    mx, my = (p1[0]+p2[0])/2, (p1[1]+p2[1])/2
+    # 法向量方向
+    nx, ny = -dy, dx
+    if bulge < 0: 
+        nx, ny = -nx, -ny
+    # normalize
+    d = (nx*nx+ny*ny)**0.5
+    nx, ny = nx/d, ny/d
+    # h = distance from chord-mid to center
+    h = radius * cos(theta/2)
+    cx, cy = mx + nx*h, my + ny*h
+
+    # 起訖角度
+    import math
+    ang1 = math.atan2(p1[1]-cy, p1[0]-cx)
+    ang2 = ang1 + theta
+
+    pts = []
+    for i in range(segments):
+        t = ang1 + (theta * i/segments)
+        pts.append((cx + radius*cos(t), cy + radius*sin(t)))
+    return pts
+
+
+
+
 
 def extract_lines_from_layer(doc, layer_name):
     model_space = doc.ModelSpace
@@ -1848,6 +1923,10 @@ def extract_lines_from_layer(doc, layer_name):
 
 
 # 1. 提取 bisector_line 圖層的線段
+print('-'*50)
+print("🔎 提取 bisector_line 圖層的線段中...")
+print('-'*50)
+
 bisector_layer_name = 'bisector_line'
 bisector_lines = extract_lines_from_layer(doc, bisector_layer_name)
 
@@ -1943,13 +2022,16 @@ def annotate_areas(
 
     # 6. 刷新视图
     acad.ActiveDocument.Regen(0)
-    print(f"✅ 已在 CAD 圖層「{layer_name}」標註 {label_prefix} 面積")
 
     # 返回 subregions 以备后续分析
     return subregions
 
 
 # ===== 使用示例 =====
+
+print('-'*50)
+print("🔎 取得集水區面積中...")
+print('-'*50)
 
 # （1）住宅区面积
 street_subs = annotate_areas(
@@ -1979,7 +2061,7 @@ road_subs = annotate_areas(
     region=roads,
     bisector_lines=road_cut_segs,
     skeleton_lines=[road_skeleton],
-    inset_eps=1e-8,
+    inset_eps=1e-5,
     layer_name="road_area",
     label_prefix="道路",
     min_area=100,
@@ -2104,12 +2186,31 @@ def draw_catch_basin(
             ln.Update()
 
 
+
+def is_clockwise(points):
+    """
+    判斷多段線的繪製方向是否為順時針。
+    points: [(x1,y1), (x2,y2), ...]
+    回傳：True（順時針）或 False（逆時針）
+    """
+    area = 0
+    n = len(points)
+    for i in range(n):
+        j = (i + 1) % n
+        area += points[i][0] * points[j][1]
+        area -= points[j][0] * points[i][1]
+    return area > 0
+
+
+
+
 def batch_offset_polylines(
     doc,
     polylines_info,
     offset_dist,
     width,
     square_width,
+    catch_basin_interval,
     draw_junction_angle,
     insetsize,
     dst_layer='test_off'
@@ -2139,60 +2240,148 @@ def batch_offset_polylines(
 
     for info in polylines_info:
         ent = doc.HandleToObject(info['handle'])
-        # h = info['handle']
-        # print(h)
+        
+        # 獲取多段線座標，判斷方向
+        coords = list(ent.Coordinates)
+        points = [(coords[i], coords[i+1]) for i in range(0, len(coords), 2)]
+        clockwise = is_clockwise(points)
+        direction = 1 if clockwise else -1  # 順時針需要負偏移才能向外，逆時針用正偏移
+ 
         # 計算偏移距離清單
         offsets = ([offset_dist+width/2, offset_dist-width/2, offset_dist]
                    if width>0 else [offset_dist])
+        # 調整偏移方向以確保向外
+        adjusted_offsets = [dist * direction for dist in offsets]
+        
         centers = []
-        for dist in offsets:
-            res = ent.Offset(dist)
-            ents = list(res) if isinstance(res,(tuple,list)) else [res]
-            for ne in ents:
-                ne.Layer = dst_layer
-                if abs(dist-offset_dist)<1e-6:
-                    ne.Linetype = dashed
-                    ne.LinetypeScale = 1.0
-                    centers.append(ne)
-                ne.Update()
-                success_count += 1
+        for dist in adjusted_offsets:
+            try:
+                res = ent.Offset(dist)
+                ents = list(res) if isinstance(res, (tuple, list)) else [res]
+                for ne in ents:
+                    ne.Layer = dst_layer
+                    # 中心線設為虛線
+                    if abs(dist - offset_dist * direction) < 1e-6:
+                        ne.Linetype = dashed
+                        ne.LinetypeScale = 1.0
+                        centers.append(ne)
+                    ne.Update()
+                    success_count += 1
+            except Exception as e:
+                print(f"⚠️ 偏移失敗，handle {info['handle']}，錯誤：{e}")
+                continue
 
         # 在偏移後中心線各頂點決定是否繪製集水井
-        if square_width>0:
-            half = square_width/2
+        # if square_width>0:
+        #     half = square_width/2
+        #     for ne in centers:
+        #         if not hasattr(ne,'Coordinates'):
+        #             continue
+        #         arr  = list(ne.Coordinates)
+        #         pts2 = [(arr[i*2],arr[i*2+1]) for i in range(len(arr)//2)]
+        #         for j,(cx,cy) in enumerate(pts2):
+        #             # 計算前後夾角
+        #             p_prev = pts2[j-1] if j>0 else pts2[-1]
+        #             p_next = pts2[j+1] if j<len(pts2)-1 else pts2[0]
+        #             ang = vertex_angle(p_prev,(cx,cy),p_next)
+        #             if ang is None: continue
+        #             # 角度範圍檢查
+        #             if not (draw_junction_angle[0] <= ang <= draw_junction_angle[1]):
+        #                 continue
+        #             # 取 bulge 並決定向量
+        #             bulge = 0
+        #             if ent.ObjectName=='AcDbPolyline':
+        #                 try: bulge = ne.GetBulge(j)
+        #                 except: bulge=0
+        #             if bulge!=0 and j>0:
+        #                 dx = cx - pts2[j-1][0]
+        #                 dy = cy - pts2[j-1][1]
+        #             else:
+        #                 nx_,ny_ = pts2[(j+1)%len(pts2)]
+        #                 dx = nx_-cx; dy = ny_-cy
+
+        #             # 標準化
+        #             L = math.hypot(dx,dy)
+        #             if L<1e-6: dx,dy=1,0
+        #             else: dx/=L; dy/=L
+        #             angle = math.atan2(dy,dx)
+
+        #             # 繪製集水井
+        #             draw_catch_basin(
+        #                 ms, cx, cy,
+        #                 angle, half,
+        #                 insetsize, dst_layer
+        #             )
+        #             square_count += 1
+        # 在偏移後中心線各頂點決定是否繪製集水井
+        if square_width > 0:
+            half = square_width / 2
             for ne in centers:
-                if not hasattr(ne,'Coordinates'):
+                if not hasattr(ne, 'Coordinates'):
                     continue
-                arr  = list(ne.Coordinates)
-                pts2 = [(arr[i*2],arr[i*2+1]) for i in range(len(arr)//2)]
-                for j,(cx,cy) in enumerate(pts2):
-                    # 計算前後夾角
-                    p_prev = pts2[j-1] if j>0 else pts2[-1]
-                    p_next = pts2[j+1] if j<len(pts2)-1 else pts2[0]
-                    ang = vertex_angle(p_prev,(cx,cy),p_next)
-                    if ang is None: continue
-                    # 角度範圍檢查
+                arr = list(ne.Coordinates)
+                pts2 = [(arr[i*2], arr[i*2+1]) for i in range(len(arr)//2)]
+
+                # 遍歷每對相鄰點，檢查線段長度並添加集水井
+                for j in range(len(pts2)):
+                    p1 = pts2[j]
+                    p2 = pts2[(j+1) % len(pts2)] if j < len(pts2) - 1 else pts2[0]
+
+                    # 計算線段長度
+                    segment_length = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                    
+                    # 計算需要添加的集水井數量（不包括端點）
+                    num_catch_basins = int(segment_length // catch_basin_interval)
+                    
+                    # 如果需要添加集水井，計算間隔並插值
+                    if num_catch_basins > 0:
+                        interval = segment_length / (num_catch_basins + 1)
+                        dx = p2[0] - p1[0]
+                        dy = p2[1] - p1[1]
+                        angle = math.atan2(dy, dx)
+
+                        for k in range(1, num_catch_basins + 1):
+                            t = (k * interval) / segment_length
+                            cx = p1[0] + t * dx
+                            cy = p1[1] + t * dy
+                            draw_catch_basin(
+                                ms, cx, cy,
+                                angle, half,
+                                insetsize, dst_layer
+                            )
+                            square_count += 1
+
+                    # 原有邏輯：在頂點處繪製集水井（根據角度）
+                    cx, cy = p1
+                    p_prev = pts2[j-1] if j > 0 else pts2[-1]
+                    p_next = pts2[(j+1) % len(pts2)]
+                    ang = vertex_angle(p_prev, (cx, cy), p_next)
+                    if ang is None:
+                        continue
                     if not (draw_junction_angle[0] <= ang <= draw_junction_angle[1]):
                         continue
-                    # 取 bulge 並決定向量
                     bulge = 0
-                    if ent.ObjectName=='AcDbPolyline':
-                        try: bulge = ne.GetBulge(j)
-                        except: bulge=0
-                    if bulge!=0 and j>0:
+                    if ent.ObjectName == 'AcDbPolyline':
+                        try:
+                            bulge = ne.GetBulge(j)
+                        except:
+                            bulge = 0
+                    if bulge != 0 and j > 0:
                         dx = cx - pts2[j-1][0]
                         dy = cy - pts2[j-1][1]
                     else:
-                        nx_,ny_ = pts2[(j+1)%len(pts2)]
-                        dx = nx_-cx; dy = ny_-cy
+                        nx_, ny_ = pts2[(j+1) % len(pts2)]
+                        dx = nx_ - cx
+                        dy = ny_ - cy
 
-                    # 標準化
-                    L = math.hypot(dx,dy)
-                    if L<1e-6: dx,dy=1,0
-                    else: dx/=L; dy/=L
-                    angle = math.atan2(dy,dx)
+                    L = math.hypot(dx, dy)
+                    if L < 1e-6:
+                        dx, dy = 1, 0
+                    else:
+                        dx /= L
+                        dy /= L
+                    angle = math.atan2(dy, dx)
 
-                    # 繪製集水井
                     draw_catch_basin(
                         ms, cx, cy,
                         angle, half,
@@ -2203,6 +2392,10 @@ def batch_offset_polylines(
     doc.Regen(0)
     print(f"✅ 偏移完成: {success_count} 條, 集水井: {square_count} 個。")
 
+print('-'*50)
+print("🔎 繪製側溝及集水井中...")
+print('-'*50)
+
 
 # 示例调用
 batch_offset_polylines(
@@ -2211,7 +2404,11 @@ batch_offset_polylines(
     offset_dist=1.0,
     width=1,      # 側溝寬度
     square_width=1.2,  # 集水井邊長
-    draw_junction_angle = [90, 160],
+    catch_basin_interval = 40,  #側溝每隔幾米要繪製一個集水井
+    draw_junction_angle = [10, 170],
     insetsize=0.2,
     dst_layer='test_off'
 )
+
+
+
